@@ -1,5 +1,9 @@
 # Save as: ComfyUI/custom_nodes/favorite_prompt_mixer_node.py
-import json, random, re, requests, traceback
+import json, random, re, traceback
+try:
+    import requests  # optional; required for LLM backends
+except Exception:
+    requests = None
 from typing import List, Dict, Any, Tuple
 
 # ---------- Comfy enums & helpers ----------
@@ -23,7 +27,7 @@ except Exception as e:
     csd = None
     print("[FavoritePromptMixer] WARNING: comfy internals not found; checkpoint loading disabled.", e)
 
-# ========= (A) ÇÁ·ÒÇÁÆ® º»¹® ÆÄ¼­ =========
+# ========= (A) ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Æ® ï¿½ï¿½ï¿½ï¿½ ï¿½Ä¼ï¿½ =========
 def _parse_user_prompts_block(block: str) -> List[str]:
     if not block or not block.strip():
         return []
@@ -45,7 +49,7 @@ def _parse_user_prompts_block(block: str) -> List[str]:
             seen.add(merged)
     return prompts
 
-# ========= (B) Çì´õ ÆÄ¼­ =========
+# ========= (B) ï¿½ï¿½ï¿½ ï¿½Ä¼ï¿½ =========
 _HEADER_PAIR_RE = re.compile(r"""
     (?P<key>[A-Za-z_][A-Za-z0-9_\- ]*)
     \s*[:=]\s*
@@ -140,7 +144,7 @@ def _extract_header_and_body(text: str) -> Tuple[Tuple[str,int,float,str,str,str
     body = "\n".join(body_lines)
     return (name_val, steps, cfg, sampler, scheduler, checkpoint, loras), body
 
-# ========= (C) enum Å° Á¤±ÔÈ­ =========
+# ========= (C) enum Å° ï¿½ï¿½ï¿½ï¿½È­ =========
 def _normalize_choice(enum_obj, name: str, default_key: str) -> str:
     if not name:
         return default_key
@@ -151,7 +155,7 @@ def _normalize_choice(enum_obj, name: str, default_key: str) -> str:
             return k
     return default_key
 
-# ========= (D) Checkpoint ·Îµå & LoRA Àû¿ë =========
+# ========= (D) Checkpoint ï¿½Îµï¿½ & LoRA ï¿½ï¿½ï¿½ï¿½ =========
 def _resolve_checkpoint_filename(name: str) -> str:
     if folder_paths is None or not name:
         return name
@@ -233,10 +237,10 @@ def _apply_loras(model, clip, loras: Dict[str, float]):
 class FavoritePromptMixerNode:
     """
     Favorite Prompt Mixer
-    (+Header¿¡ name/steps/cfg/sampler/scheduler/checkpoint/LoRA ÁöÁ¤
-     ¡æ MODEL/CLIP/VAE & positive_text/negative_text µ¿½Ã Ãâ·Â)
-    - positive/negative´Â TEXT·Î¸¸ Ãâ·ÂµË´Ï´Ù.
-    - CLIP ÀÎÄÚµùÀº º°µµÀÇ 'CLIP Text Encode' ³ëµå¿¡¼­ ¼öÇàÇÏ¼¼¿ä.
+    (+Headerï¿½ï¿½ name/steps/cfg/sampler/scheduler/checkpoint/LoRA ï¿½ï¿½ï¿½ï¿½
+     ï¿½ï¿½ MODEL/CLIP/VAE & positive_text/negative_text ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½)
+    - positive/negativeï¿½ï¿½ TEXTï¿½Î¸ï¿½ ï¿½ï¿½ÂµË´Ï´ï¿½.
+    - CLIP ï¿½ï¿½ï¿½Úµï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ 'CLIP Text Encode' ï¿½ï¿½å¿¡ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ï¿½Ï¼ï¿½ï¿½ï¿½.
     """
 
     @classmethod
@@ -251,8 +255,8 @@ class FavoritePromptMixerNode:
             "required": {
                 "prompts_text": ("STRING", {
                     "multiline": True,
-                    "default": header_example + "\n\n# --- ÇÁ·ÒÇÁÆ® ---\nmasterpiece, best quality, 1girl, solo, full body",
-                    "placeholder": header_example + "\n\n# --- ÇÁ·ÒÇÁÆ® ---\n..."
+                    "default": header_example + "\n\n# --- ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Æ® ---\nmasterpiece, best quality, 1girl, solo, full body",
+                    "placeholder": header_example + "\n\n# --- ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Æ® ---\n..."
                 }),
                 "always_prefix": ("STRING", {"default": "masterpiece, best quality"}),
                 "always_suffix": ("STRING", {"default": ""}),
@@ -276,7 +280,7 @@ class FavoritePromptMixerNode:
             }
         }
 
-    # Ãâ·Â:
+    # ï¿½ï¿½ï¿½:
     # name, steps, cfg, sampler, scheduler, model, clip, vae, positive_text, negative_text
     RETURN_TYPES = ("STRING","INT","FLOAT", SAMPLER_ENUM, SCHEDULER_ENUM, "MODEL","CLIP","VAE","STRING","STRING")
     RETURN_NAMES = ("name","steps","cfg","sampler_name","scheduler","model","clip","vae","positive_text","negative_text")
@@ -285,6 +289,8 @@ class FavoritePromptMixerNode:
 
     # ---------- Backends ----------
     def _ollama_chat(self, endpoint, model, messages, temperature, timeout):
+        if requests is None:
+            raise RuntimeError("requests package not installed. Run: pip install requests")
         url = endpoint.rstrip("/") + "/api/chat"
         payload = {"model": model, "messages": messages, "stream": False, "options": {"temperature": float(temperature)}}
         r = requests.post(url, json=payload, timeout=timeout)
@@ -293,6 +299,8 @@ class FavoritePromptMixerNode:
         return data.get("message", {}).get("content", "")
 
     def _openai_compat(self, endpoint, model, messages, temperature, timeout):
+        if requests is None:
+            raise RuntimeError("requests package not installed. Run: pip install requests")
         url = endpoint.rstrip("/") + "/v1/chat/completions"
         payload = {"model": model, "messages": messages, "temperature": float(temperature), "stream": False}
         r = requests.post(url, json=payload, timeout=timeout)
@@ -438,10 +446,10 @@ Constraints:
 
         rnd = random.Random(seed if seed != 0 else None)
 
-        # (1) Çì´õ ÃßÃâ
+        # (1) ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½
         (name_val, steps_val, cfg_val, sampler_txt, scheduler_txt, ckpt_name, lora_dict), body_text = _extract_header_and_body(prompts_text)
 
-        # (2) º»¹®¿¡¼­ ÇÁ·ÒÇÁÆ® ¸ñ·Ï ÆÄ½Ì + prefix
+        # (2) ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Æ® ï¿½ï¿½ï¿½ ï¿½Ä½ï¿½ + prefix
         user_prompts = _parse_user_prompts_block(body_text)
         prefixed = []
         for p in user_prompts or ["1girl, solo, full body, anime style"]:
@@ -450,7 +458,7 @@ Constraints:
             prefixed.append(merged)
         base = prefixed[max(0, min(index, len(prefixed)-1))] if (select_mode=="index") else rnd.choice(prefixed)
 
-        # (3) Àá±Ý ÅäÅ«(¸Ó¸®/´« °ü·Ã) ÃßÃâ
+        # (3) ï¿½ï¿½ï¿½ ï¿½ï¿½Å«(ï¿½Ó¸ï¿½/ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½) ï¿½ï¿½ï¿½ï¿½
         locked_tokens = self._extract_locked_tokens_from_base(base) if lock_appearance else []
         locked_text = ", ".join(locked_tokens) if locked_tokens else "(none)"
         messages = [{"role":"system","content": self._system_prompt()},
@@ -478,15 +486,15 @@ Constraints:
                                           allow_camera, allow_lighting,
                                           lock_appearance, always_suffix)
 
-        # (4) sampler/scheduler Á¤±ÔÈ­
+        # (4) sampler/scheduler ï¿½ï¿½ï¿½ï¿½È­
         sampler_key   = _normalize_choice(SAMPLER_ENUM,   sampler_txt,   "euler_ancestral")
         scheduler_key = _normalize_choice(SCHEDULER_ENUM, scheduler_txt, "karras")
 
-        # (5) Ã¼Å©Æ÷ÀÎÆ® ·Îµå + LoRA Àû¿ë (¡æ model/clip/vae Ãâ·Â)
+        # (5) Ã¼Å©ï¿½ï¿½ï¿½ï¿½Æ® ï¿½Îµï¿½ + LoRA ï¿½ï¿½ï¿½ï¿½ (ï¿½ï¿½ model/clip/vae ï¿½ï¿½ï¿½)
         model_obj, clip_obj, vae_obj = _load_checkpoint(ckpt_name)
         model_obj, clip_obj = _apply_loras(model_obj, clip_obj, lora_dict)
 
-        # µð¹ö±×
+        # ï¿½ï¿½ï¿½ï¿½ï¿½
         print("[FavoritePromptMixer] header -> name:", name_val,
               "| steps:", steps_val, "cfg:", cfg_val,
               "sampler:", sampler_key, "scheduler:", scheduler_key,
@@ -495,7 +503,7 @@ Constraints:
         print("[FavoritePromptMixer] final prompt   :", final_text)
         print("[FavoritePromptMixer] negative prompt:", (negative_text or "")[:120])
 
-        # (6) Ãâ·Â: name, steps, cfg, sampler, scheduler, MODEL, CLIP, VAE, positive_text, negative_text
+        # (6) ï¿½ï¿½ï¿½: name, steps, cfg, sampler, scheduler, MODEL, CLIP, VAE, positive_text, negative_text
         return (
             str(name_val or ""),
             int(steps_val),
@@ -513,7 +521,7 @@ NODE_CLASS_MAPPINGS = {
     "FavoritePromptMixer": FavoritePromptMixerNode
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "FavoritePromptMixer": "Favorite Prompt Mixer (+Header ckpt/LoRA ¡æ MODEL/CLIP/VAE & texts)"
+    "FavoritePromptMixer": "Favorite Prompt Mixer (+Header ckpt/LoRA ï¿½ï¿½ MODEL/CLIP/VAE & texts)"
 }
 
 
