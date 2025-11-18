@@ -27,7 +27,7 @@ def _save_counter_db(db: dict) -> None:
         pass
 
 def _db_key(label: str, path: str, pattern: str) -> str:
-    # label + path + pattern Á¶ÇÕÀ¸·Î Å° »ı¼º (°æ·Î/ÆĞÅÏÀÌ ´Ù¸£¸é ÁøÇà ÀÎµ¦½º¸¦ ºĞ¸®)
+    # label + path + pattern ì¡°í•©ìœ¼ë¡œ í‚¤ ìƒì„± (ê²½ë¡œ/íŒ¨í„´ ë°”ë€Œë©´ ì¸ë±ìŠ¤ ë¦¬ì…‹)
     return f"{label}::{os.path.abspath(path)}::{pattern}"
 
 def _get_sha256(file_path: str) -> str:
@@ -54,7 +54,7 @@ class _TextBatchLoader:
         self.index = int(self._db.get(self._key, 0)) if self.text_paths else 0
 
     def _load_texts(self):
-        # glob.escape·Î °æ·Î ¾ÈÀü Ã³¸®, ** »ç¿ë ½Ã recursive=True ÇÊ¿ä
+        # glob.escapeë¡œ ê²½ë¡œ ì•ˆì „ ì²˜ë¦¬, ** ì‚¬ìš© ì‹œ recursive=True í•„ìš”
         search_path = os.path.join(glob.escape(self.directory_path), self.pattern)
         for p in glob.glob(search_path, recursive=True):
             if os.path.isfile(p):
@@ -117,7 +117,7 @@ class Load_Text_Batch_Simple:
                 "encoding": ("STRING", {"default": "utf-8", "multiline": False}),
                 "errors": ("STRING", {"default": "ignore", "multiline": False}),  # 'strict'/'replace'/'ignore'
                 "strip_trailing_newlines": (["false", "true"],),
-                "filename_text_extension": (["true", "false"],),  # false¸é È®ÀåÀÚ Á¦°Å
+                "filename_text_extension": (["true", "false"],),  # falseë©´ í™•ì¥ì ì œê±°
             },
         }
 
@@ -140,7 +140,7 @@ class Load_Text_Batch_Simple:
         filename_text_extension="true",
     ):
         if not path or not os.path.exists(path):
-            # Comfy ±Ô¾à»ó None ´ë½Å ºó ¹®ÀÚ¿­ ¹İÈ¯
+            # Comfy ê·œì•½ìƒ None ëŒ€ì‹  ë¹ˆ ë¬¸ìì—´ ë°˜í™˜
             return ("", "")
 
         tl = _TextBatchLoader(path, label, pattern)
@@ -173,10 +173,10 @@ class Load_Text_Batch_Simple:
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
-        # single_text ¸ğµå¿¡¼­¸¸ Ä³½Ã Å°(sha) °íÁ¤
+        # single_text ëª¨ë“œì—ì„œë§Œ ìºì‹œ í‚¤(sha) ê³ ì •
         if kwargs.get("mode") != "single_text":
             return float("NaN")
-        # path / label / pattern·Î ÇöÀç ÆÄÀÏÀ» Ã£¾Æ sha °è»ê
+        # path / label / patternìœ¼ë¡œ í˜„ì¬ íŒŒì¼ëª… ì°¾ì•„ì„œ sha
         tl = _TextBatchLoader(kwargs.get("path", ""), kwargs.get("label", "Batch 001"), kwargs.get("pattern", "*.txt"))
         filename = tl.get_current_filename()
         if not filename:
@@ -187,7 +187,7 @@ class Load_Text_Batch_Simple:
         except Exception:
             return float("NaN")
 
-# ComfyUI ³ëµå µî·Ï
+# ComfyUI ë…¸ë“œ ë“±ë¡
 NODE_CLASS_MAPPINGS = {
     "Load_Text_Batch_Simple": Load_Text_Batch_Simple,
 }
@@ -195,5 +195,3 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Load_Text_Batch_Simple": "Load Text Batch (Simple)",
 }
-
-

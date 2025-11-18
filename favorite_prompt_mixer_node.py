@@ -1,9 +1,5 @@
 # Save as: ComfyUI/custom_nodes/favorite_prompt_mixer_node.py
-import json, random, re, traceback
-try:
-    import requests  # optional; required for LLM backends
-except Exception:
-    requests = None
+import json, random, re, requests, traceback, os, hashlib
 from typing import List, Dict, Any, Tuple
 
 # ---------- Comfy enums & helpers ----------
@@ -21,13 +17,15 @@ try:
     import folder_paths
     import comfy.utils as cutils
     import comfy.sd as csd
+    import nodes as comfy_nodes
 except Exception as e:
     folder_paths = None
     cutils = None
     csd = None
-    print("[FavoritePromptMixer] WARNING: comfy internals not found; checkpoint loading disabled.", e)
+    comfy_nodes = None
+    print("[FavoritePromptMixer] WARNING: comfy internals not found; checkpoint/LoRA loading unavailable.", e)
 
-# ========= (A) ������Ʈ ���� �ļ� =========
+# ========= (A) 프롬프트 블록 파서 =========
 def _parse_user_prompts_block(block: str) -> List[str]:
     if not block or not block.strip():
         return []
@@ -49,7 +47,7 @@ def _parse_user_prompts_block(block: str) -> List[str]:
             seen.add(merged)
     return prompts
 
-# ========= (B) ��� �ļ� =========
+# ========= (B) 헤더 파서 =========
 _HEADER_PAIR_RE = re.compile(r"""
     (?P<key>[A-Za-z_][A-Za-z0-9_\- ]*)
     \s*[:=]\s*
@@ -66,30 +64,82 @@ def _strip_invisible(s: str) -> str:
         return s
     return s.translate(_INVISIBLE)
 
-def _parse_lora_block(first_line: str) -> Dict[str, float]:
-    out: Dict[str, float] = {}
+def _parse_weight_pair(val: Any) -> Tuple[float, float]:
+    """
+    다양한 입력을 유연하게 해석:
+      - 0.8                 -> (0.8, 0.8)
+      - "0.7"               -> (0.7, 0.7)
+      - "unet=0.6, te=0.5"  -> (0.6, 0.5)
+      - {"unet":0.7,"te":0.4}-> (0.7, 0.4)
+    기본값: (1.0, 1.0)
+    """
+    def _f(x, d):
+        try: return float(x)
+        except: return d
+
+    if isinstance(val, (int, float)):
+        f = float(val)
+        return (f, f)
+
+    if isinstance(val, dict):
+        u = _f(val.get("unet", val.get("model", 1.0)), 1.0)
+        t = _f(val.get("te", val.get("clip", 1.0)), 1.0)
+        return (u, t)
+
+    if isinstance(val, str):
+        s = val.strip()
+        if re.fullmatch(r"[+-]?(\d+(\.\d+)?|\.\d+)", s):
+            f = float(s); return (f, f)
+        # "unet=0.6, te=0.5" 같은 형태
+        u = re.search(r"(?:unet|model)\s*=\s*([+-]?\d+(?:\.\d+)?)", s, re.I)
+        t = re.search(r"(?:te|clip)\s*=\s*([+-]?\d+(?:\.\d+)?)", s, re.I)
+        uu = float(u.group(1)) if u else 1.0
+        tt = float(t.group(1)) if t else 1.0
+        return (uu, tt)
+
+    return (1.0, 1.0)
+
+def _parse_lora_block(first_line: str) -> Dict[str, Tuple[float, float]]:
+    """
+    리턴: { "lora_name" : (unet_w, te_w), ... }
+    """
+    out: Dict[str, Tuple[float,float]] = {}
     if not first_line:
         return out
     m = _LORA_BLOCK_RE.search(_strip_invisible(first_line))
     if not m:
         return out
     body = m.group("body")
-    for pair in re.split(r"[\n,;]+", body.strip()):
-        if not pair or ":" not in pair:
+    # split by comma/semicolon but be tolerant with inner braces
+    parts = re.split(r"(?<!\})\s*[,\n;]\s*(?![^{}]*\})", body.strip())
+    for part in parts:
+        if not part or ":" not in part:
             continue
-        k, v = pair.split(":", 1)
+        k, v = part.split(":", 1)
         name = k.strip().strip('"').strip("'")
-        try:
-            strength = float(v.strip())
-        except Exception:
-            continue
+        val_raw = v.strip()
+        # dict-like?
+        if val_raw.startswith("{") and val_raw.endswith("}"):
+            try:
+                obj = json.loads(val_raw.replace("'", '"'))
+            except Exception:
+                # fallback tolerant parse "unet:0.7, te:0.5"
+                obj = {}
+                for s in re.split(r"[,\n;]+", val_raw.strip("{} \t")):
+                    if ":" in s:
+                        kk, vv = s.split(":", 1)
+                        obj[kk.strip()] = vv.strip()
+            uw, tw = _parse_weight_pair(obj)
+        else:
+            uw, tw = _parse_weight_pair(val_raw)
         if name:
-            out[name] = strength
+            out[name] = (uw, tw)
     return out
 
-def _extract_header_and_body(text: str) -> Tuple[Tuple[str,int,float,str,str,str,Dict[str,float]], str]:
+def _extract_header_and_body(text: str) -> Tuple[Tuple[str,int,float,str,str,str,Dict[str,Tuple[float,float]]], str]:
     """
     리턴: ((name, steps, cfg, sampler, scheduler, checkpoint, loras_dict), body_text)
+    loras_dict: { lora_name : (unet_w, te_w) }
     """
     DEFAULTS = ("", 30, 7.0, "euler_ancestral", "karras", "", {})
     if not text:
@@ -112,7 +162,7 @@ def _extract_header_and_body(text: str) -> Tuple[Tuple[str,int,float,str,str,str
         return DEFAULTS, text
 
     name_val, steps, cfg, sampler, scheduler, checkpoint = "", 30, 7.0, "euler_ancestral", "karras", ""
-    loras: Dict[str,float] = {}
+    loras: Dict[str,Tuple[float,float]] = {}
     try:
         for m in _HEADER_PAIR_RE.finditer(first):
             key = m.group("key").strip().lower()
@@ -144,7 +194,7 @@ def _extract_header_and_body(text: str) -> Tuple[Tuple[str,int,float,str,str,str
     body = "\n".join(body_lines)
     return (name_val, steps, cfg, sampler, scheduler, checkpoint, loras), body
 
-# ========= (C) enum Ű ����ȭ =========
+# ========= (C) enum 키 노멀라이즈 =========
 def _normalize_choice(enum_obj, name: str, default_key: str) -> str:
     if not name:
         return default_key
@@ -155,92 +205,112 @@ def _normalize_choice(enum_obj, name: str, default_key: str) -> str:
             return k
     return default_key
 
-# ========= (D) Checkpoint �ε� & LoRA ���� =========
-def _resolve_checkpoint_filename(name: str) -> str:
-    if folder_paths is None or not name:
-        return name
-    avail = folder_paths.get_filename_list("checkpoints")
-    t = name.strip().lower()
+# ========= (D) 파일명 매칭 유틸 =========
+def _resolve_from_list(target: str, avail: List[str]) -> str:
+    if not target:
+        return target
+    t = _strip_invisible(target).strip().lower()
+    # exact
     for a in avail:
         if a.lower() == t:
             return a
+    # basename equal
     tbase = t.rsplit(".", 1)[0]
     for a in avail:
-        if a.lower().rsplit(".",1)[0] == tbase:
+        if a.lower().rsplit(".", 1)[0] == tbase:
             return a
+    # prefix
     for a in avail:
         if a.lower().startswith(tbase):
             return a
-    return name
+    return target
 
-def _load_checkpoint(ckpt_name: str):
+def _resolve_checkpoint_filename(name: str) -> str:
+    if folder_paths is None or not name:
+        return name
+    return _resolve_from_list(name, folder_paths.get_filename_list("checkpoints"))
+
+def _resolve_lora_filename(name: str) -> str:
+    if folder_paths is None or not name:
+        return name
+    return _resolve_from_list(name, folder_paths.get_filename_list("loras"))
+
+# ========= (E) Checkpoint 로드 & LoRA 적용 =========
+def _load_checkpoint_clean(ckpt_name: str):
     if folder_paths is None or csd is None:
         raise RuntimeError("Comfy internals unavailable; cannot load checkpoint.")
     if not ckpt_name:
         raise RuntimeError("checkpoint is not specified in header.")
+
     ckpt_name = _resolve_checkpoint_filename(ckpt_name)
     ckpt_path = folder_paths.get_full_path("checkpoints", ckpt_name)
     print(f"[FavoritePromptMixer] Loading checkpoint: {ckpt_name} -> {ckpt_path}")
-    # same as CheckpointLoaderSimple
-    out = csd.load_checkpoint_guess_config(
-        ckpt_path,
-        None, None,
-        True,  # output_vae
-        True,  # output_clip
-        True   # embedding_directory (auto)
-    )
-    # load_checkpoint_guess_config returns (model, clip, vae) in current Comfy
-    model, clip, vae = out[0], out[1], out[2]
-    return model, clip, vae
 
-def _resolve_lora_filename(name: str) -> str:
-    if folder_paths is None:
-        return name
-    available = folder_paths.get_filename_list("loras")
-    t = _strip_invisible(name.strip().lower())
-    for a in available:
-        if a.lower() == t:
-            return a
-    tbase = t.rsplit(".", 1)[0]
-    for a in available:
-        abase = a.lower().rsplit(".", 1)[0]
-        if abase == tbase:
-            return a
-    for a in available:
-        if a.lower().startswith(tbase):
-            return a
-    return name
+    # 1차: guess_config (모델/CLIP/VAE 모두 산출)
+    try:
+        out = csd.load_checkpoint_guess_config(
+            ckpt_path,
+            None, None,
+            True,   # output_vae
+            True,   # output_clip
+            True    # embedding_directory (auto)
+        )
+        model, clip, vae = out[0], out[1], out[2]
+        if clip is not None:
+            return model, clip, vae, ckpt_name
+        else:
+            print("[FavoritePromptMixer] WARN: clip is None after guess_config. Falling back...")
+    except Exception as e:
+        print("[FavoritePromptMixer] WARN: guess_config failed:", e)
 
-def _apply_loras(model, clip, loras: Dict[str, float]):
+    # 2차: CheckpointLoaderSimple 폴백
+    if comfy_nodes is None:
+        raise RuntimeError("Cannot import Comfy nodes for fallback loader, and clip is None.")
+    try:
+        loader = comfy_nodes.CheckpointLoaderSimple()
+        model, clip, vae = loader.load_checkpoint(ckpt_name)
+        if clip is None:
+            raise RuntimeError("Fallback loader also returned clip=None.")
+        return model, clip, vae, ckpt_name
+    except Exception as e:
+        raise RuntimeError(f"Checkpoint fallback load failed: {e}")
+
+def _apply_loras(model, clip, loras: Dict[str, Tuple[float,float]]):
+    """
+    loras: { name: (unet_w, te_w) }
+    Comfy의 load_lora_for_models를 그대로 사용 (SDXL/SD1.x 모두 커버).
+    """
     if not loras or csd is None or cutils is None or folder_paths is None:
         return model, clip
-    updated_model, updated_clip = model, clip
-    try:
-        avail = folder_paths.get_filename_list("loras")
-        print(f"[FavoritePromptMixer] Available LoRAs: {len(avail)} items")
-    except Exception:
-        pass
-    for raw_name, w in loras.items():
+
+    for raw_name, (w_unet, w_te) in loras.items():
         lname = _resolve_lora_filename(raw_name)
         try:
             lpath = folder_paths.get_full_path("loras", lname)
-            print(f"[FavoritePromptMixer] Applying LoRA: {raw_name} -> {lname} | w={w}")
+        except Exception:
+            print(f"[FavoritePromptMixer] LoRA not found in loras dir: '{raw_name}' (resolved '{lname}')")
+            continue
+
+        print(f"[FavoritePromptMixer] Applying LoRA: {raw_name} -> {lname} | unet={w_unet}, te={w_te}")
+        try:
             lobj = cutils.load_torch_file(lpath, safe_load=True)
-            updated_model, updated_clip = csd.load_lora_for_models(updated_model, updated_clip, lobj, float(w), float(w))
+            model, clip = csd.load_lora_for_models(model, clip, lobj, float(w_unet), float(w_te))
         except Exception as e:
+            # shape mismatch 등 문제 발생 시 나머지는 계속 적용
             print(f"[FavoritePromptMixer] Failed to apply LoRA '{raw_name}' -> '{lname}': {e}")
             traceback.print_exc()
-    return updated_model, updated_clip
+    return model, clip
 
 # ======================================================================================
 
 class FavoritePromptMixerNode:
     """
     Favorite Prompt Mixer
-    (+Header�� name/steps/cfg/sampler/scheduler/checkpoint/LoRA ����
-     �� MODEL/CLIP/VAE & positive_text/negative_text ���� ���)
-    - positive/negative�� TEXT�θ� ��µ˴ϴ�.
-    - CLIP ���ڵ��� ������ 'CLIP Text Encode' ��忡�� �����ϼ���.
+    (+Header → name/steps/cfg/sampler/scheduler/checkpoint/LoRA
+     → MODEL/CLIP/VAE & positive_text/negative_text)
+    - positive/negative는 TEXT로만 출력합니다.
+    - CLIP 인코딩은 외부의 'CLIP Text Encode' 노드에서 수행하세요.
+    - 본 노드는 매 실행시 체크포인트를 재로드하여 이전 LoRA 잔존을 방지합니다.
     """
 
     @classmethod
@@ -248,15 +318,15 @@ class FavoritePromptMixerNode:
         header_example = (
             "name : bluearchive, steps : 24, cfg : 7.0, sampler : euler_ancestral, scheduler : karras, "
             "checkpoint : unholyDesireMixSinister_v50.safetensors, "
-            "lora : { ppw_v8_Illuv1_128.safetensors : 0.70, rouge-nikke-richy-v1_ixl.safetensors : 1.00 }"
+            "lora : { ppw_v8_Illuv1_128.safetensors : 0.70, rouge-nikke-richy-v1_ixl.safetensors : {unet:0.8, te:0.5} }"
         )
         neg_default = "lowres, bad anatomy, bad hands, text, watermark, jpeg artifacts, out of frame, extra fingers, mutated hands, poorly drawn"
         return {
             "required": {
                 "prompts_text": ("STRING", {
                     "multiline": True,
-                    "default": header_example + "\n\n# --- ������Ʈ ---\nmasterpiece, best quality, 1girl, solo, full body",
-                    "placeholder": header_example + "\n\n# --- ������Ʈ ---\n..."
+                    "default": header_example + "\n\n# --- 프롬프트 ---\nmasterpiece, best quality, 1girl, solo, full body",
+                    "placeholder": header_example + "\n\n# --- 프롬프트 ---\n..."
                 }),
                 "always_prefix": ("STRING", {"default": "masterpiece, best quality"}),
                 "always_suffix": ("STRING", {"default": ""}),
@@ -280,17 +350,15 @@ class FavoritePromptMixerNode:
             }
         }
 
-    # ���:
-    # name, steps, cfg, sampler, scheduler, model, clip, vae, positive_text, negative_text
-    RETURN_TYPES = ("STRING","INT","FLOAT", SAMPLER_ENUM, SCHEDULER_ENUM, "MODEL","CLIP","VAE","STRING","STRING")
-    RETURN_NAMES = ("name","steps","cfg","sampler_name","scheduler","model","clip","vae","positive_text","negative_text")
+    # 출력:
+    # name, steps, cfg, sampler, scheduler, model, clip, vae, positive_text, negative_text, checkpoint_name
+    RETURN_TYPES = ("STRING","INT","FLOAT", SAMPLER_ENUM, SCHEDULER_ENUM, "MODEL","CLIP","VAE","STRING","STRING","STRING")
+    RETURN_NAMES = ("name","steps","cfg","sampler_name","scheduler","model","clip","vae","positive_text","negative_text","checkpoint_name")
     FUNCTION = "build"
     CATEGORY = "Prompt/Favorites+AI"
 
     # ---------- Backends ----------
     def _ollama_chat(self, endpoint, model, messages, temperature, timeout):
-        if requests is None:
-            raise RuntimeError("requests package not installed. Run: pip install requests")
         url = endpoint.rstrip("/") + "/api/chat"
         payload = {"model": model, "messages": messages, "stream": False, "options": {"temperature": float(temperature)}}
         r = requests.post(url, json=payload, timeout=timeout)
@@ -299,8 +367,6 @@ class FavoritePromptMixerNode:
         return data.get("message", {}).get("content", "")
 
     def _openai_compat(self, endpoint, model, messages, temperature, timeout):
-        if requests is None:
-            raise RuntimeError("requests package not installed. Run: pip install requests")
         url = endpoint.rstrip("/") + "/v1/chat/completions"
         payload = {"model": model, "messages": messages, "temperature": float(temperature), "stream": False}
         r = requests.post(url, json=payload, timeout=timeout)
@@ -446,10 +512,10 @@ Constraints:
 
         rnd = random.Random(seed if seed != 0 else None)
 
-        # (1) ��� ����
+        # (1) 헤더 추출
         (name_val, steps_val, cfg_val, sampler_txt, scheduler_txt, ckpt_name, lora_dict), body_text = _extract_header_and_body(prompts_text)
 
-        # (2) �������� ������Ʈ ��� �Ľ� + prefix
+        # (2) 본문에서 프롬프트 목록 파싱 + prefix
         user_prompts = _parse_user_prompts_block(body_text)
         prefixed = []
         for p in user_prompts or ["1girl, solo, full body, anime style"]:
@@ -458,7 +524,7 @@ Constraints:
             prefixed.append(merged)
         base = prefixed[max(0, min(index, len(prefixed)-1))] if (select_mode=="index") else rnd.choice(prefixed)
 
-        # (3) ��� ��ū(�Ӹ�/�� ����) ����
+        # (3) 보조 디테일 생성
         locked_tokens = self._extract_locked_tokens_from_base(base) if lock_appearance else []
         locked_text = ", ".join(locked_tokens) if locked_tokens else "(none)"
         messages = [{"role":"system","content": self._system_prompt()},
@@ -486,24 +552,24 @@ Constraints:
                                           allow_camera, allow_lighting,
                                           lock_appearance, always_suffix)
 
-        # (4) sampler/scheduler ����ȭ
+        # (4) sampler/scheduler 정규화
         sampler_key   = _normalize_choice(SAMPLER_ENUM,   sampler_txt,   "euler_ancestral")
         scheduler_key = _normalize_choice(SCHEDULER_ENUM, scheduler_txt, "karras")
 
-        # (5) üũ����Ʈ �ε� + LoRA ���� (�� model/clip/vae ���)
-        model_obj, clip_obj, vae_obj = _load_checkpoint(ckpt_name)
+        # (5) 체크포인트 로드(매번 깨끗하게) + LoRA 적용
+        model_obj, clip_obj, vae_obj, ckpt_name_resolved = _load_checkpoint_clean(ckpt_name)
         model_obj, clip_obj = _apply_loras(model_obj, clip_obj, lora_dict)
 
-        # �����
+        # 디버그
         print("[FavoritePromptMixer] header -> name:", name_val,
               "| steps:", steps_val, "cfg:", cfg_val,
               "sampler:", sampler_key, "scheduler:", scheduler_key,
               "| checkpoint:", ckpt_name)
-        print("[FavoritePromptMixer] loras:", lora_dict)
+        print("[FavoritePromptMixer] loras (parsed):", lora_dict)
         print("[FavoritePromptMixer] final prompt   :", final_text)
         print("[FavoritePromptMixer] negative prompt:", (negative_text or "")[:120])
 
-        # (6) ���: name, steps, cfg, sampler, scheduler, MODEL, CLIP, VAE, positive_text, negative_text
+        # (6) 출력
         return (
             str(name_val or ""),
             int(steps_val),
@@ -514,14 +580,13 @@ Constraints:
             clip_obj,
             vae_obj,
             final_text,
-            negative_text or ""
+            negative_text or "",
+            ckpt_name_resolved,
         )
 
 NODE_CLASS_MAPPINGS = {
     "FavoritePromptMixer": FavoritePromptMixerNode
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "FavoritePromptMixer": "Favorite Prompt Mixer (+Header ckpt/LoRA �� MODEL/CLIP/VAE & texts)"
+    "FavoritePromptMixer": "Favorite Prompt Mixer (+Header→ckpt/LoRA→MODEL/CLIP/VAE & texts)"
 }
-
-
